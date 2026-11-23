@@ -1,5 +1,9 @@
 # MCP Server — Book Navigation Implementation Guide
 
+> **SUPERSEDED** — `book_session.py` and the `book_*` tools were never shipped
+> and have been removed. The search cursor (`07-pagination-tools.md`) plus the
+> volume tools now cover this. Kept for reference only.
+
 This document tells an implementing AI exactly what to create and where.  
 Read `14-book-navigation.md` first for the full tool contracts.
 

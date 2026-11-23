@@ -1,5 +1,11 @@
 # MCP Server — Book Navigation Tool Contracts
 
+> **SUPERSEDED** — the `book_*` tools described in this document were removed.
+> The search cursor (`07-pagination-tools.md`) plus the volume tools now cover
+> this: `search_books` + `cursor_next` step through books item by item, and
+> the volume tools take an optional `book_id` that defaults to the book the
+> cursor points at. Kept for reference only.
+
 These tools provide a **stateful reading context** that remembers the currently selected book,
 its chapter list, and the current position within a chapter's image list.  
 This removes the need for the AI to manually track and pass `book_id`, `chapter_id`, and

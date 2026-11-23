@@ -625,137 +625,318 @@ Call `init_scratch()` once at MCP server startup, before registering any tools.
 
 ## Step 7b — `cursor_store.py`
 
+Single active search, item-level stepping. `search()` fetches a window of up
+to `CHUNK_SIZE` (200) items and replaces any previous cursor. `cursor_next` /
+`cursor_prev` move one item at a time; when the window runs out they return a
+sentinel carrying the `offset` the agent needs to re-issue the same search.
+The server never re-fetches automatically.
+
+Two single-active **list cursors** sit below the search cursor: the chapter
+cursor (type `"c"`) and the image cursor (type `"i"`). `volume_list_chapters`
+and `volume_list_images` open them (full list fetched on open, cursor pointed
+at the first entry) and `chapter_next`/`chapter_prev` and `image_next`/
+`image_prev` step them. The whole list is fetched on open, so there is no
+offset/resume — only `exhausted`/`at_start` sentinels. Opening a new search
+or `cursor_close()` drops the active list cursor.
+
 ```python
-import math
 import uuid
 from dataclasses import dataclass, field
-import media_client
-import volume_client
 
-PAGE_SIZE  = 20
-CHUNK_SIZE = 200
+CHUNK_SIZE = 200  # items fetched from the backend per HTTP request
+
+STATUS_EXHAUSTED    = "exhausted"
+STATUS_WINDOW_START = "window_start"
+STATUS_AT_START     = "at_start"
 
 @dataclass
 class Cursor:
-    cursor_id:    str
-    domain:       str        # "books" | "media"
-    params:       dict       # frozen search params
-    chunk:        list       # current fetched items
-    chunk_offset: int        # server offset of chunk[0]
-    page_index:   int        # current page within chunk (0-based)
-    total:        int        # total items reported by server
+    cursor_id: str
+    type:      str        # "v" | "m" | "md"
+    params:    dict       # original search parameters (frozen after open)
+    items:     list = field(default_factory=list)  # current fetched window
+    offset:    int = 0    # server offset of items[0]
+    index:     int = 0    # 0-based position within items[]
+    total:     int = 0    # total items on the server
 
-CURSORS: dict[str, Cursor] = {}
+# Module-level singleton: only ONE active cursor
+ACTIVE: Cursor | None = None
 
 
-def _fetch_chunk(cursor: Cursor, offset: int) -> None:
-    """Re-fetch a chunk at the given server offset and update cursor state."""
-    if cursor.domain == "books":
-        result = volume_client.list_books(
-            offset=offset, limit=CHUNK_SIZE, **cursor.params
+def _fetch(type: str, params: dict, offset: int, limit: int):
+    """Return (items, total) fetched from the backend for this search type."""
+    from mcp_server import _client  # shared MediaServerClient instance
+    if type == "v":
+        body = _client.books.list_books(
+            offset=offset, limit=limit,
+            filter_text=params.get("filter_text", ""),
+            filter_tags=params.get("filter_tags", ""),
+            rating_limit=params.get("rating_limit", 0),
+            sorting=params.get("sorting", "AZ"),
+            filter_type=params.get("filter_type", ""),
         )
-        cursor.chunk = result["books"]
-        cursor.total = result["paging"]["total"]
-    elif cursor.domain == "media_by_date":
-        result = media_client.list_media_by_date(
-            offset=offset, limit=CHUNK_SIZE, **cursor.params
-        )
-        cursor.chunk = result["folders"] + result["files"]
-        cursor.total = result["paging"]["total"]
-    else:  # "media"
-        result = media_client.list_media(
-            offset=offset, limit=CHUNK_SIZE, **cursor.params
-        )
-        folders = [{"type": "folder", **f} for f in result["folders"]]
-        files   = [{"type": "file",   **f} for f in result["files"]]
-        cursor.chunk = folders + files
-        cursor.total = result["paging"]["total"]
-    cursor.chunk_offset = offset
-    cursor.page_index   = 0
+        return body.get("books", []), int(body.get("paging", {}).get("total", 0))
+    if type in ("m", "md"):
+        if type == "m":
+            body = _client.media.list_media(
+                folder_id=params.get("folder_id", ""),
+                offset=offset, limit=limit,
+                rating_limit=params.get("rating_limit", 0),
+                sorting=params.get("sorting", "AZ"),
+                filter_text=params.get("filter_text", ""),
+            )
+        else:
+            body = _client.media.list_media_by_date(
+                start_date=params.get("start_date", ""),
+                end_date=params.get("end_date", ""),
+                offset=offset, limit=limit,
+                rating_limit=params.get("rating_limit", 0),
+                sorting=params.get("sorting", "DA"),
+            )
+        items = [{"type": "folder", **f} for f in body.get("folders", [])]
+        items += [{"type": "file", **f} for f in body.get("files", [])]
+        return items, int(body.get("paging", {}).get("total", 0))
+    raise ValueError(f"Unknown cursor type: {type}")
 
 
-def _make_response(cursor: Cursor) -> dict:
-    start = cursor.page_index * PAGE_SIZE
-    page_items = cursor.chunk[start : start + PAGE_SIZE]
-    global_start = cursor.chunk_offset + start
-    total_pages = math.ceil(cursor.total / PAGE_SIZE) if cursor.total > 0 else 1
-    current_page = (global_start // PAGE_SIZE) + 1
-    has_next = (global_start + len(page_items)) < cursor.total
-    has_prev = global_start > 0
+def _fetch_window(c: Cursor, offset: int) -> None:
+    items, total = _fetch(c.type, c.params, offset, CHUNK_SIZE)
+    c.items  = items
+    c.offset = offset
+    c.index  = 0
+    c.total  = total
+
+
+def _envelope(c: Cursor) -> dict:
+    """Normal envelope: the item the cursor is pointing at."""
     return {
-        "cursor_id":   cursor.cursor_id,
-        "page":        current_page,
-        "total_pages": total_pages,
-        "total_items": cursor.total,
-        "has_next":    has_next,
-        "has_prev":    has_prev,
-        "items":       page_items,
+        "cursor_id": c.cursor_id,
+        "type":      c.type,
+        "index":     c.index,
+        "content":   c.items[c.index] if c.items else None,
+        "total":     c.total,
     }
 
 
-def open_cursor(domain: str, params: dict) -> dict:
-    cursor = Cursor(
-        cursor_id=uuid.uuid4().hex,
-        domain=domain,
-        params=params,
-        chunk=[],
-        chunk_offset=0,
-        page_index=0,
-        total=0,
-    )
-    _fetch_chunk(cursor, offset=0)
-    CURSORS[cursor.cursor_id] = cursor
-    return _make_response(cursor)
+def _sentinel(c: Cursor, status: str, offset: int | None = None) -> dict:
+    """Sentinel envelope: no current item, plus the offset needed to continue."""
+    return {
+        "cursor_id": c.cursor_id,
+        "type":      c.type,
+        "index":     c.index,
+        "content":   None,
+        "offset":    c.offset + len(c.items) if offset is None else offset,
+        "total":     c.total,
+        "status":    status,
+    }
 
 
-def cursor_next(cursor_id: str) -> dict:
-    cursor = CURSORS.get(cursor_id)
-    if cursor is None:
-        raise RuntimeError(f"Cursor not found: {cursor_id}")
+def search(type: str, params: dict, offset: int = 0) -> dict:
+    """Open a new search and replace any previous cursor.
 
-    next_start = (cursor.page_index + 1) * PAGE_SIZE
-
-    if next_start < len(cursor.chunk):
-        # Still items left in the current chunk
-        cursor.page_index += 1
-        return _make_response(cursor)
-
-    # Need more data from the server
-    next_chunk_offset = cursor.chunk_offset + len(cursor.chunk)
-    if next_chunk_offset >= cursor.total:
-        return {"done": True, "cursor_id": cursor_id}
-
-    _fetch_chunk(cursor, offset=next_chunk_offset)
-    return _make_response(cursor)
+    Also discards any active chapter/image cursor. Returns the first item
+    of the fetch window, or an exhausted sentinel when the search has no
+    results.
+    """
+    global ACTIVE, ACTIVE_LIST
+    c = Cursor(cursor_id=str(uuid.uuid4()), type=type, params=dict(params))
+    _fetch_window(c, offset)
+    ACTIVE = c
+    ACTIVE_LIST = None
+    if c.items:
+        return _envelope(c)
+    return _sentinel(c, STATUS_EXHAUSTED)
 
 
-def cursor_prev(cursor_id: str) -> dict:
-    cursor = CURSORS.get(cursor_id)
-    if cursor is None:
-        raise RuntimeError(f"Cursor not found: {cursor_id}")
-
-    if cursor.page_index > 0:
-        cursor.page_index -= 1
-        return _make_response(cursor)
-
-    if cursor.chunk_offset == 0:
-        return {"at_start": True, "cursor_id": cursor_id}
-
-    # Load the previous chunk
-    prev_offset = max(0, cursor.chunk_offset - CHUNK_SIZE)
-    _fetch_chunk(cursor, offset=prev_offset)
-    # Position at the last full page of the newly loaded chunk
-    last_page = max(0, (len(cursor.chunk) - 1) // PAGE_SIZE)
-    cursor.page_index = last_page
-    return _make_response(cursor)
+def _active() -> Cursor:
+    if ACTIVE is None:
+        raise RuntimeError("No active search — call search_books or search_media first")
+    return ACTIVE
 
 
-def cursor_close(cursor_id: str) -> dict:
-    CURSORS.pop(cursor_id, None)
-    return {"closed": True, "cursor_id": cursor_id}
+def cursor_info() -> dict:
+    """Describe the active cursor without moving it (no network call)."""
+    c = _active()
+    return {
+        "cursor_id": c.cursor_id,
+        "type":      c.type,
+        "index":     c.index,
+        "content":   c.items[c.index] if c.items else None,
+        "offset":    c.offset,
+        "fetched":   len(c.items),
+        "total":     c.total,
+    }
+
+
+def cursor_next() -> dict:
+    """Advance one item. Sentinel at the end of the fetched window."""
+    c = _active()
+    if c.index + 1 < len(c.items):
+        c.index += 1
+        return _envelope(c)
+    return _sentinel(c, STATUS_EXHAUSTED)
+
+
+def cursor_prev() -> dict:
+    """Move back one item. Sentinel at the start of the fetched window."""
+    c = _active()
+    if c.index > 0:
+        c.index -= 1
+        return _envelope(c)
+    if c.offset > 0:
+        return _sentinel(c, STATUS_WINDOW_START, offset=c.offset - CHUNK_SIZE)
+    return _sentinel(c, STATUS_AT_START)
+
+
+def cursor_close() -> dict:
+    """Discard the active search and any active list cursor."""
+    global ACTIVE, ACTIVE_LIST
+    if ACTIVE is None and ACTIVE_LIST is None:
+        return {"closed": False}
+    ACTIVE = None
+    ACTIVE_LIST = None
+    return {"closed": True}
 ```
 
-**Checkpoint:** `open_cursor("books", {})` returns a dict with `items` (up to 20 entries) and a `cursor_id`.
+**List cursors** (appended to the same module):
+
+```python
+@dataclass
+class ListCursor:
+    """Single-active cursor over a fully fetched list: the chapters of one
+    book (type "c") or the image files of one chapter (type "i")."""
+    cursor_id: str
+    type: str            # "c" | "i"
+    book_id: str
+    chapter_id: str | None   # None on a chapter cursor
+    items: list          # full list, fetched on open
+    index: int = 0       # 0-based position within items[]
+
+# Module-level singleton: only ONE active list cursor
+ACTIVE_LIST: ListCursor | None = None
+
+
+def _list_active() -> ListCursor:
+    if ACTIVE_LIST is None:
+        raise RuntimeError(
+            "No active chapter/image cursor — call volume_list_chapters or "
+            "volume_list_images first")
+    return ACTIVE_LIST
+
+
+def _list_envelope(c: ListCursor) -> dict:
+    """Normal envelope: the item the list cursor is pointing at."""
+    return {
+        "cursor_id":  c.cursor_id,
+        "type":       c.type,
+        "book_id":    c.book_id,
+        "chapter_id": c.chapter_id,
+        "index":      c.index,
+        "content":    c.items[c.index],
+        "total":      len(c.items),
+    }
+
+
+def _list_sentinel(c: ListCursor, status: str) -> dict:
+    """Sentinel envelope: no current item on a fully fetched list."""
+    return {
+        "cursor_id":  c.cursor_id,
+        "type":       c.type,
+        "book_id":    c.book_id,
+        "chapter_id": c.chapter_id,
+        "index":      c.index,
+        "content":    None,
+        "total":      len(c.items),
+        "status":     status,
+    }
+
+
+def open_list_cursor(type: str, book_id: str, chapter_id: str | None,
+                     items: list) -> dict:
+    """Point the list cursor at items (fetched by the caller) and replace
+    any previous list cursor. Returns the first item's envelope, or an
+    exhausted sentinel when the list is empty."""
+    global ACTIVE_LIST
+    ACTIVE_LIST = ListCursor(cursor_id=str(uuid.uuid4()), type=type,
+                             book_id=book_id, chapter_id=chapter_id,
+                             items=list(items))
+    c = ACTIVE_LIST
+    if c.items:
+        return _list_envelope(c)
+    return _list_sentinel(c, STATUS_EXHAUSTED)
+
+
+def current_chapter_id() -> str:
+    """Chapter id from the active list cursor (for param fallback): the
+    chapter the chapter cursor points at, or the chapter an image cursor is
+    scoped to (opening the image cursor replaces the chapter cursor)."""
+    c = _list_active()
+    if c.type == "c":
+        return c.items[c.index]["value"]
+    if c.type == "i":
+        return c.chapter_id
+    raise RuntimeError("No active chapter/image cursor — call volume_list_chapters first")
+
+
+def current_image_filename() -> str:
+    """Filename the image cursor points at (for param fallback)."""
+    c = _list_active()
+    if c.type != "i":
+        raise RuntimeError("No active image cursor — call volume_list_images first")
+    return c.items[c.index]
+
+
+def list_info() -> dict:
+    """Describe the active list cursor without moving it (no network call)."""
+    c = _list_active()
+    return {
+        "cursor_id":  c.cursor_id,
+        "type":       c.type,
+        "book_id":    c.book_id,
+        "chapter_id": c.chapter_id,
+        "index":      c.index,
+        "content":    c.items[c.index] if c.items else None,
+        "total":      len(c.items),
+    }
+
+
+def list_next() -> dict:
+    """Advance the list cursor one item; exhausted sentinel at the end."""
+    c = _list_active()
+    if c.index + 1 < len(c.items):
+        c.index += 1
+        return _list_envelope(c)
+    return _list_sentinel(c, STATUS_EXHAUSTED)
+
+
+def list_prev() -> dict:
+    """Move the list cursor back one item; at_start sentinel on item 0."""
+    c = _list_active()
+    if c.index > 0:
+        c.index -= 1
+        return _list_envelope(c)
+    return _list_sentinel(c, STATUS_AT_START)
+
+
+def list_close() -> dict:
+    """Discard the active list cursor (the search cursor is untouched)."""
+    global ACTIVE_LIST
+    if ACTIVE_LIST is None:
+        return {"closed": False}
+    ACTIVE_LIST = None
+    return {"closed": True}
+```
+
+`search()` and `cursor_close()` above also set `ACTIVE_LIST = None` so the
+book → chapter → image stack stays coherent when the book changes.
+
+**Checkpoint:** `search("v", {})` returns `{ cursor_id, type: "v", index: 0, content, total }`; `cursor_next()` with no arguments advances one item; past the last fetched item it returns `{ status: "exhausted", offset, total }`.
+
+**Volume cursor fallback:** in `mcp_server.py` the volume get/update tools take
+`book_id: str = ""` and resolve it through `_book_id_from_cursor()` — the
+argument wins, otherwise the active cursor's current item is used, otherwise a
+`RuntimeError` is raised. `search_media` / `search_media_by_date` search types
+(`"m"`, `"md"`) never satisfy the fallback (only `type == "v"` does).
 
 This is the entry point.  It registers every tool and starts the stdio MCP loop.
 
@@ -870,31 +1051,95 @@ async def call_tool(name: str, arguments: dict):
             )
             return [types.TextContent(type="text", text=str(result))]
 
+        # --- Volume cursor fallback: book_id optional; the active search
+        # cursor's current item is used when the argument is omitted ---
+
+        def _book_id_from_cursor(book_id: str | None) -> str:
+            if book_id:
+                return book_id
+            c = cursor_store.ACTIVE
+            if c is not None and c.type == "v" and c.items:
+                return c.items[c.index]["id"]
+            raise RuntimeError(
+                "No book_id given and no active book search pointing at a book — "
+                "pass book_id or run search_books first")
+
+        # --- List-cursor fallbacks: chapter_id / filename optional; the
+        # active chapter/image cursor's current item is used when omitted ---
+
+        def _chapter_id_from_cursor(chapter_id: str | None) -> str:
+            if chapter_id:
+                return chapter_id
+            return cursor_store.current_chapter_id()
+
+        def _filename_from_cursor(filename: str | None) -> str:
+            if filename:
+                return filename
+            return cursor_store.current_image_filename()
+
+        def _book_field_from_cursor(field: str, book_id: str | None):
+            # One-horse-pony getters: fetch the book, return one field
+            book = volume_client.get_book(_book_id_from_cursor(book_id))
+            return book.get(field)
+
         case "volume_get_book":
-            result = volume_client.get_book(arguments["book_id"])
+            result = volume_client.get_book(_book_id_from_cursor(arguments.get("book_id", "")))
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "volume_get_name":
+            result = _book_field_from_cursor("name", arguments.get("book_id", ""))
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "volume_get_alt_name":
+            result = _book_field_from_cursor("alt_name", arguments.get("book_id", ""))
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "volume_get_style":
+            result = _book_field_from_cursor("style", arguments.get("book_id", ""))
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "volume_get_tags":
+            tags = _book_field_from_cursor("tags", arguments.get("book_id", ""))
+            result = json.dumps(tags if tags is not None else [])
+            return [types.TextContent(type="text", text=result)]
+
+        case "volume_get_rating":
+            result = _book_field_from_cursor("rating", arguments.get("book_id", ""))
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "volume_get_active":
+            result = _book_field_from_cursor("active", arguments.get("book_id", ""))
             return [types.TextContent(type="text", text=str(result))]
 
         case "volume_list_chapters":
-            result = volume_client.list_chapters(arguments["book_id"])
+            book_id = _book_id_from_cursor(arguments.get("book_id", ""))
+            body = volume_client.list_chapters(book_id)
+            # Side effect: point the chapter cursor at the first chapter
+            cursor_store.open_list_cursor("c", book_id, None, body.get("chapters", []))
+            result = body
             return [types.TextContent(type="text", text=str(result))]
 
         case "volume_list_images":
-            result = volume_client.list_images(
-                arguments["book_id"], arguments["chapter_id"]
-            )
+            book_id   = _book_id_from_cursor(arguments.get("book_id", ""))
+            chapter_id = _chapter_id_from_cursor(arguments.get("chapter_id", ""))
+            body = volume_client.list_images(book_id, chapter_id)
+            # Side effect: point the image cursor at the first file
+            cursor_store.open_list_cursor("i", book_id, chapter_id, body.get("files", []))
+            result = body
             return [types.TextContent(type="text", text=str(result))]
 
         case "volume_get_image":
+            book_id   = _book_id_from_cursor(arguments.get("book_id", ""))
+            chapter_id = _chapter_id_from_cursor(arguments.get("chapter_id", ""))
+            filename   = _filename_from_cursor(arguments.get("filename", ""))
             raw_bytes, mime_type = volume_client.get_image(
-                arguments["book_id"],
-                arguments["chapter_id"],
-                arguments["filename"],
+                book_id, chapter_id, filename,
             )
             import base64 as _b64
             meta = {
-                "book_id":    arguments["book_id"],
-                "chapter_id": arguments["chapter_id"],
-                "filename":   arguments["filename"],
+                "book_id":    book_id,
+                "chapter_id": chapter_id,
+                "filename":   filename,
             }
             return [
                 types.ImageContent(
@@ -906,12 +1151,13 @@ async def call_tool(name: str, arguments: dict):
             ]
 
         case "volume_update_title":
-            result = volume_client.update_title(arguments["book_id"], arguments["name"])
+            result = volume_client.update_title(
+                _book_id_from_cursor(arguments.get("book_id", "")), arguments["name"])
             return [types.TextContent(type="text", text=str(result))]
 
         case "volume_update_alt_name":
             result = volume_client.update_alt_name(
-                arguments["book_id"], arguments["alt_name"]
+                _book_id_from_cursor(arguments.get("book_id", "")), arguments["alt_name"]
             )
             return [types.TextContent(type="text", text=str(result))]
 
@@ -919,12 +1165,36 @@ async def call_tool(name: str, arguments: dict):
             tags = arguments["tags"]
             if isinstance(tags, str):
                 tags = [t.strip() for t in tags.split(",") if t.strip()]
-            result = volume_client.update_tags(arguments["book_id"], tags)
+            result = volume_client.update_tags(
+                _book_id_from_cursor(arguments.get("book_id", "")), tags)
             return [types.TextContent(type="text", text=str(result))]
 
         case "volume_update_rating":
             result = volume_client.update_rating(
-                arguments["book_id"], int(arguments["rating"])
+                _book_id_from_cursor(arguments.get("book_id", "")), int(arguments["rating"])
+            )
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "volume_update_style":
+            result = volume_client.update_style(
+                _book_id_from_cursor(arguments.get("book_id", "")), arguments["style"]
+            )
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "volume_update_book":
+            tags = arguments["tags"]
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+            # All fields except book_id are required — a full book definition
+            # must be passed back (fetch first via volume_get_book).
+            result = volume_client.update_book(
+                _book_id_from_cursor(arguments.get("book_id", "")),
+                arguments["name"], arguments["alt_name"],
+                int(arguments["rating"]), tags, bool(arguments["active"]),
+                arguments["info_url"], arguments["rss_url"],
+                arguments["extra_url"], arguments["start_chapter"],
+                arguments["skip"], arguments["style"],
+                arguments["processor"],
             )
             return [types.TextContent(type="text", text=str(result))]
 
@@ -984,7 +1254,7 @@ async def call_tool(name: str, arguments: dict):
             )
             return [types.TextContent(type="text", text=str(result))]
 
-        # Pagination / search cursors
+        # Search cursors (item-level, single active search)
         case "search_books":
             params = {
                 "rating_limit": int(arguments.get("rating_limit", 0)),
@@ -993,7 +1263,7 @@ async def call_tool(name: str, arguments: dict):
                 "sorting":      arguments.get("sorting", "AZ"),
                 "filter_type":  arguments.get("filter_type", ""),
             }
-            result = cursor_store.open_cursor("books", params)
+            result = cursor_store.search("v", params, offset=int(arguments.get("offset", 0)))
             return [types.TextContent(type="text", text=str(result))]
 
         case "search_media":
@@ -1003,7 +1273,7 @@ async def call_tool(name: str, arguments: dict):
                 "filter_text":  arguments.get("filter_text", ""),
                 "sorting":      arguments.get("sorting", "AZ"),
             }
-            result = cursor_store.open_cursor("media", params)
+            result = cursor_store.search("m", params, offset=int(arguments.get("offset", 0)))
             return [types.TextContent(type="text", text=str(result))]
 
         case "search_media_by_date":
@@ -1013,19 +1283,40 @@ async def call_tool(name: str, arguments: dict):
                 "rating_limit": int(arguments.get("rating_limit", 0)),
                 "sorting":      arguments.get("sorting", "DA"),
             }
-            result = cursor_store.open_cursor("media_by_date", params)
+            result = cursor_store.search("md", params, offset=int(arguments.get("offset", 0)))
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "cursor_info":
+            result = cursor_store.cursor_info()
             return [types.TextContent(type="text", text=str(result))]
 
         case "cursor_next":
-            result = cursor_store.cursor_next(arguments["cursor_id"])
+            result = cursor_store.cursor_next()
             return [types.TextContent(type="text", text=str(result))]
 
         case "cursor_prev":
-            result = cursor_store.cursor_prev(arguments["cursor_id"])
+            result = cursor_store.cursor_prev()
             return [types.TextContent(type="text", text=str(result))]
 
         case "cursor_close":
-            result = cursor_store.cursor_close(arguments["cursor_id"])
+            result = cursor_store.cursor_close()
+            return [types.TextContent(type="text", text=str(result))]
+
+        # Chapter/image list cursors (single active, full list on open)
+        case "chapter_next":
+            result = cursor_store.list_next()
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "chapter_prev":
+            result = cursor_store.list_prev()
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "image_next":
+            result = cursor_store.list_next()
+            return [types.TextContent(type="text", text=str(result))]
+
+        case "image_prev":
+            result = cursor_store.list_prev()
             return [types.TextContent(type="text", text=str(result))]
 
         case _:
@@ -1047,14 +1338,22 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(name="media_migrate_file",    description="Move a file between storage tiers. target_storage: 0=primary, 1=archive.", inputSchema={"type":"object","properties":{"file_id":{"type":"string"},"target_storage":{"type":"integer","enum":[0,1]}},"required":["file_id","target_storage"]}),
         types.Tool(name="media_get_preview",     description="Get the preview image for a folder or file. Pass has_preview from item metadata; returns ImageContent or a no-preview marker.", inputSchema={"type":"object","properties":{"item_id":{"type":"string"},"has_preview":{"type":"boolean"}},"required":["item_id","has_preview"]}),
         types.Tool(name="volume_list_books",     description="List books (volumes) with optional filters.", inputSchema={"type":"object","properties":{"offset":{"type":"integer"},"limit":{"type":"integer"},"rating_limit":{"type":"integer"},"filter_text":{"type":"string"},"filter_tags":{"type":"string"},"sorting":{"type":"string"},"filter_type":{"type":"string"}}}),
-        types.Tool(name="volume_get_book",       description="Get full details for a single book.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"}},"required":["book_id"]}),
-        types.Tool(name="volume_list_chapters",  description="List all chapters for a book.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"}},"required":["book_id"]}),
-        types.Tool(name="volume_list_images",    description="List image filenames in a book chapter.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"chapter_id":{"type":"string"}},"required":["book_id","chapter_id"]}),
-        types.Tool(name="volume_get_image",      description="Retrieve a single chapter image by filename; returns base64 content.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"chapter_id":{"type":"string"},"filename":{"type":"string"}},"required":["book_id","chapter_id","filename"]}),
-        types.Tool(name="volume_update_title",   description="Update a book's display title.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"name":{"type":"string"}},"required":["book_id","name"]}),
-        types.Tool(name="volume_update_alt_name",description="Update a book's alternative name.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"alt_name":{"type":"string"}},"required":["book_id","alt_name"]}),
-        types.Tool(name="volume_update_tags",    description="Replace a book's tags list.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}},"required":["book_id","tags"]}),
-        types.Tool(name="volume_update_rating",  description="Update a book's rating.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"rating":{"type":"integer"}},"required":["book_id","rating"]}),
+        types.Tool(name="volume_get_book",       description="Get full details for a single book. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"}}}),
+        types.Tool(name="volume_get_name",       description="Get just the book's title. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"}}}),
+        types.Tool(name="volume_get_alt_name",   description="Get just the book's alternative name. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"}}}),
+        types.Tool(name="volume_get_style",      description="Get just the book's layout style (\"page\" or \"scroll\"). book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"}}}),
+        types.Tool(name="volume_get_tags",       description="Get just the book's tag list as a JSON array of strings (e.g. [\"MC:A\", \"x\"]; \"[]\" when empty). book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"}}}),
+        types.Tool(name="volume_get_rating",     description="Get just the book's rating. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"}}}),
+        types.Tool(name="volume_get_active",     description="Get just the book's active flag. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"}}}),
+        types.Tool(name="volume_list_chapters",  description="List all chapters for a book and point the chapter cursor at the first one. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"}}}),
+        types.Tool(name="volume_list_images",    description="List image filenames in a book chapter and point the image cursor at the first one. chapter_id optional — defaults to the chapter the active chapter/image cursor points at; book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"chapter_id":{"type":"string"}}}),
+        types.Tool(name="volume_get_image",      description="Retrieve a single chapter image; returns image content. chapter_id optional — defaults to the active chapter/image cursor; filename optional — defaults to the active image cursor; book_id optional — defaults to the active search cursor.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"chapter_id":{"type":"string"},"filename":{"type":"string"}}}),
+        types.Tool(name="volume_update_title",   description="Update a book's display title. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"name":{"type":"string"}},"required":["name"]}),
+        types.Tool(name="volume_update_alt_name",description="Update a book's alternative name. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"alt_name":{"type":"string"}},"required":["alt_name"]}),
+        types.Tool(name="volume_update_tags",    description="Replace a book's tags list. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}},"required":["tags"]}),
+        types.Tool(name="volume_update_rating",  description="Update a book's rating. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"rating":{"type":"integer"}},"required":["rating"]}),
+        types.Tool(name="volume_update_style",   description="Update a book's display style (\"page\" or \"scroll\"). book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"style":{"type":"string"}},"required":["style"]}),
+        types.Tool(name="volume_update_book",    description="Update all editable fields of a book at once. All fields except book_id are required; pass a full definition from volume_get_book. book_id optional — defaults to the book the active search cursor points at.", inputSchema={"type":"object","properties":{"book_id":{"type":"string"},"name":{"type":"string"},"alt_name":{"type":"string"},"rating":{"type":"integer"},"tags":{"type":"array","items":{"type":"string"}},"active":{"type":"boolean"},"info_url":{"type":"string"},"rss_url":{"type":"string"},"extra_url":{"type":"string"},"start_chapter":{"type":"string"},"skip":{"type":"string"},"style":{"type":"string"},"processor":{"type":"string"}},"required":["name","alt_name","rating","tags","active","info_url","rss_url","extra_url","start_chapter","skip","style","processor"]}),
         types.Tool(name="volume_list_tags",      description="List all available book tags.", inputSchema={"type":"object","properties":{}}),
         types.Tool(name="process_list",          description="List all tasks (queued, running, finished) and worker status.", inputSchema={"type":"object","properties":{"page":{"type":"integer"},"page_size":{"type":"integer"},"extra_method":{"type":"string"}}}),
         types.Tool(name="process_get_status",    description="Get full status and optional log for a single task. Poll this to track progress.", inputSchema={"type":"object","properties":{"task_id":{"type":"integer"},"log_page":{"type":"integer"},"log_page_size":{"type":"integer"},"include_files":{"type":"boolean"}},"required":["task_id"]}),
@@ -1064,12 +1363,17 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(name="process_restart_server",description="DANGEROUS: restart the background worker process. Running tasks are interrupted. Only call when explicitly requested by the user.", inputSchema={"type":"object","properties":{}}),
         types.Tool(name="plugin_list",           description="List all available plugins with their argument definitions.", inputSchema={"type":"object","properties":{}}),
         types.Tool(name="plugin_run",            description="Run a plugin by id, passing args as a flat dict. Returns task_id for tracking via process tools.", inputSchema={"type":"object","properties":{"plugin_id":{"type":"string"},"args":{"type":"object"}},"required":["plugin_id"]}),
-        types.Tool(name="search_books",          description="Open a paginated search cursor over books. Returns first page of 20 plus a cursor_id.", inputSchema={"type":"object","properties":{"filter_text":{"type":"string"},"filter_tags":{"type":"string"},"rating_limit":{"type":"integer"},"sorting":{"type":"string"},"filter_type":{"type":"string"}}}),
-        types.Tool(name="search_media",          description="Open a paginated search cursor over media folders/files. Returns first page of 20 plus a cursor_id.", inputSchema={"type":"object","properties":{"folder_id":{"type":"string"},"filter_text":{"type":"string"},"rating_limit":{"type":"integer"},"sorting":{"type":"string"}}}),
-        types.Tool(name="search_media_by_date",  description="Open a paginated cursor over media files created within a date range (YYYY-MM-DD). Default sort is newest first.", inputSchema={"type":"object","properties":{"start_date":{"type":"string"},"end_date":{"type":"string"},"rating_limit":{"type":"integer"},"sorting":{"type":"string"}},"required":["start_date","end_date"]}),
-        types.Tool(name="cursor_next",           description="Advance a search cursor by one page (20 items). Fetches next server chunk automatically when needed.", inputSchema={"type":"object","properties":{"cursor_id":{"type":"string"}},"required":["cursor_id"]}),
-        types.Tool(name="cursor_prev",           description="Move a search cursor back one page.", inputSchema={"type":"object","properties":{"cursor_id":{"type":"string"}},"required":["cursor_id"]}),
-        types.Tool(name="cursor_close",          description="Release a search cursor and free its memory.", inputSchema={"type":"object","properties":{"cursor_id":{"type":"string"}},"required":["cursor_id"]}),
+        types.Tool(name="search_books",          description="Start (or re-issue) the book search; replaces any previous search. Returns the first item { cursor_id, type: \"v\", index, content, total }. Re-issue with the offset carried by a sentinel to continue stepping.", inputSchema={"type":"object","properties":{"offset":{"type":"integer"},"filter_text":{"type":"string"},"filter_tags":{"type":"string"},"rating_limit":{"type":"integer"},"sorting":{"type":"string"},"filter_type":{"type":"string"}}}),
+        types.Tool(name="search_media",          description="Start (or re-issue) the media search over folders and files (\"\" = root); replaces any previous search. Returns the first item { cursor_id, type: \"m\", index, content, total } where content has a \"type\": \"folder\"|\"file\" field.", inputSchema={"type":"object","properties":{"folder_id":{"type":"string"},"offset":{"type":"integer"},"filter_text":{"type":"string"},"rating_limit":{"type":"integer"},"sorting":{"type":"string"}}}),
+        types.Tool(name="search_media_by_date",  description="Start (or re-issue) the media-by-date search; replaces any previous search. Returns the first item { cursor_id, type: \"md\", index, content, total }. Default sort is date descending (newest first).", inputSchema={"type":"object","properties":{"start_date":{"type":"string"},"end_date":{"type":"string"},"offset":{"type":"integer"},"rating_limit":{"type":"integer"},"sorting":{"type":"string"}},"required":["start_date","end_date"]}),
+        types.Tool(name="cursor_info",           description="Describe the active search cursor without moving it: { cursor_id, type, index, content, offset, fetched, total }.", inputSchema={"type":"object","properties":{}}),
+        types.Tool(name="cursor_next",           description="Advance the active search to the next item (one item at a time). At the end of the fetched items returns { status: \"exhausted\", offset, total } — re-issue the search with that offset to continue.", inputSchema={"type":"object","properties":{}}),
+        types.Tool(name="cursor_prev",           description="Move the active search back one item. At the start of the fetched items returns { status: \"window_start\", offset, total } (earlier items exist) or { status: \"at_start\" } on the very first item.", inputSchema={"type":"object","properties":{}}),
+        types.Tool(name="cursor_close",          description="Discard the active search cursor and any active chapter/image cursor, and free their memory.", inputSchema={"type":"object","properties":{}}),
+        types.Tool(name="chapter_next",          description="Advance the chapter cursor to the next chapter of the current book. Envelope: { cursor_id, type: \"c\", book_id, chapter_id: null, index, content: {name, value}, total }. At the last chapter returns { status: \"exhausted\" }.", inputSchema={"type":"object","properties":{}}),
+        types.Tool(name="chapter_prev",          description="Move the chapter cursor back one chapter. On the first chapter returns { status: \"at_start\" }.", inputSchema={"type":"object","properties":{}}),
+        types.Tool(name="image_next",            description="Advance the image cursor to the next file of the current chapter. Envelope: { cursor_id, type: \"i\", book_id, chapter_id, index, content: filename, total }. At the last file returns { status: \"exhausted\" }.", inputSchema={"type":"object","properties":{}}),
+        types.Tool(name="image_prev",            description="Move the image cursor back one file. On the first file returns { status: \"at_start\" }.", inputSchema={"type":"object","properties":{}}),
     ]
 
 
@@ -1105,7 +1409,7 @@ All connection and credential settings live in `config.json` — no env vars nee
 Ensure `config.json` is present in the same directory as `mcp_server.py` before starting the client.
 ```
 
-**Checkpoint:** the MCP client lists all 19 tools when it starts.
+**Checkpoint:** the MCP client lists all registered tools when it starts.
 
 ---
 
@@ -1123,11 +1427,19 @@ Run these tool calls in order via the MCP client:
 8. `media_list_folders` on the root → only folders returned
 9. `volume_list_tags` → list of tag strings
 10. `volume_update_title` with a book_id and new name → `success: True`, verify with `volume_get_book`
-11. `search_books` with no params → `cursor_id` + first 20 books, `total_items` > 0
-12. `cursor_next` with that cursor_id → next 20 books, `page` incremented
-13. `cursor_prev` → back to page 1
-14. `cursor_close` → `{ "closed": true }`
-15. `search_media` on root folder → `cursor_id` + mixed folders/files with `type` field
+11. `search_books` with no params → first item: `{ cursor_id, type: "v", index: 0, content, total }`, `total` > 0
+12. `cursor_next` → next item (index 1)
+13. `search_books(offset=<offset from an exhausted sentinel>)` → continues stepping from that window
+14. `cursor_prev` on the very first item → `{ status: "at_start" }`
+15. `volume_get_book` with no `book_id` → returns the book the cursor points at
+16. `volume_get_style` with no `book_id` → just the style field of the cursor's book
+17. `volume_list_chapters` with no `book_id` → chapters of the cursor's book; points the chapter cursor at chapter 1
+18. `volume_list_images` with no `chapter_id` → files of the chapter cursor's chapter; points the image cursor at file 1
+19. `image_next` → next file; at the end of the chapter: `{ status: "exhausted" }`
+20. `volume_get_image` with no `chapter_id`/`filename` → the image the image cursor points at
+21. `chapter_next` → next chapter; at the end of the book: `{ status: "exhausted" }`
+22. `cursor_close` → `{ "closed": true }` (also drops the chapter/image cursors)
+23. `search_media` on root folder → first item with `content` carrying a `"type": "folder"|"file"` field
 
 ---
 

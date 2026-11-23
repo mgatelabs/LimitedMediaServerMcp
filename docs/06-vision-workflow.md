@@ -36,20 +36,22 @@ Choose a book whose tags list is empty or very short — those are the best cand
 
 ```
 volume_list_chapters(book_id="<id>")
-→ take chapters[0].value  →  first_chapter_id
+→ chapters[]  →  the chapter cursor is now pointing at chapters[0]
 
-volume_list_images(book_id="<id>", chapter_id=first_chapter_id)
-→ files[]  →  list of all image filenames in the chapter
+volume_list_images()   ← chapter_id/book_id omitted: applies to the chapter
+                         the chapter cursor points at
+→ files[]  →  list of all image filenames; the image cursor points at files[0]
 ```
 
 ### 3. Vision-scan each image in the chapter
 
-Iterate through every filename in `files[]` and fetch each image individually:
+Iterate through the chapter and fetch each image individually — the image
+cursor steps with `image_next`, so `chapter_id`/`filename` can stay omitted:
 
 ```
-for filename in files:
-    volume_get_image(book_id="<id>", chapter_id=first_chapter_id, filename=filename)
-    → returns [ImageContent, TextContent]  ← pass ImageContent directly to vision
+volume_get_image()   ← applies to the image the image cursor points at
+→ returns [ImageContent, TextContent]  ← pass ImageContent directly to vision
+image_next()         ← next file; stop when a status sentinel is returned
 ```
 
 **Each call is independently authenticated by the server.** The server verifies on every request that the user has access to that specific content — sequential per-image calls are the correct and only pattern. There is no batch image endpoint.
@@ -107,7 +109,7 @@ if result["tags"]:
 
 ### 7. Verify
 
-Call `volume_get_book(book_id)` and confirm the fields were saved as expected.
+Call the single-field getters (`volume_get_name`, `volume_get_alt_name`, `volume_get_tags`) and confirm the saved values match what was written.
 
 ---
 

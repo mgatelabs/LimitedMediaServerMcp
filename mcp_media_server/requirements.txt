@@ -1,3 +1,3 @@
-git+https://github.com/mgatelabs/LimitedMediaServerClient.git@v0.1.1
+git+https://github.com/mgatelabs/LimitedMediaServerClient.git@v0.1.4
 mcp>=1.9,<2.0
 requests>=2.31

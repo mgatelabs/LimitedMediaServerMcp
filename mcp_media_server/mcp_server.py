@@ -1,7 +1,13 @@
 """Limited Media Server MCP server (FastMCP).
 
-Registers 49 tools covering auth, media, scratch, volume, process, plugin,
-and pagination domains. Run with `python mcp_server.py` (stdio transport) or
+Registers 71 tools covering auth, media, file navigation, folder stacks,
+scratch, volume, process, plugin, and cursor domains. Cursor state is a
+single active item-level search cursor plus single-active chapter and
+image list cursors; volume tools take optional book_id / chapter_id /
+filename that fall back to the cursor's current item. Single-field
+volume_get_<field> tools return just one book field instead of the whole
+book definition.
+Run with `python mcp_server.py` (stdio transport) or
 `python mcp_server.py tcp` / `python mcp_server.py http` (streamable-http).
 """
 
@@ -279,6 +285,33 @@ def _make_server() -> FastMCP:
 
     # --- volume ---
 
+    def _book_id_from_cursor(book_id: str | None) -> str:
+        """Resolve book_id from the argument, or from the active search
+        cursor when it points at a book and the argument was omitted."""
+        if book_id:
+            return book_id
+        c = cursor_store.ACTIVE
+        if c is not None and c.type == "v" and c.items:
+            return c.items[c.index]["id"]
+        raise RuntimeError(
+            "No book_id given and no active book search pointing at a book — "
+            "pass book_id or run search_books first")
+
+    def _chapter_id_from_cursor(chapter_id: str | None) -> str:
+        """Resolve chapter_id from the argument, or from the active list
+        cursor when the argument was omitted (the chapter cursor points at a
+        chapter directly; an image cursor is scoped to one)."""
+        if chapter_id:
+            return chapter_id
+        return cursor_store.current_chapter_id()
+
+    def _filename_from_cursor(filename: str | None) -> str:
+        """Resolve filename from the argument, or from the active image
+        cursor when the argument was omitted."""
+        if filename:
+            return filename
+        return cursor_store.current_image_filename()
+
     @mcp.tool()
     def volume_list_books(offset: int = 0, limit: int = 100, rating_limit: int = 0,
                           filter_text: str = "", filter_tags: str = "", sorting: str = "AZ",
@@ -289,50 +322,128 @@ def _make_server() -> FastMCP:
                                         sorting=sorting, filter_type=filter_type)
 
     @mcp.tool()
-    def volume_get_book(book_id: str) -> dict:
-        """Get full details of one book."""
-        return _client.books.get_book(book_id)
+    def volume_get_book(book_id: str | None = None) -> dict:
+        """Get full details of one book. book_id optional — defaults to the
+        book the active search cursor is pointing at."""
+        return _client.books.get_book(_book_id_from_cursor(book_id))
+
+    def _book_field_from_cursor(field: str, book_id: str | None):
+        """Fetch one book field, resolving book_id from the active search
+        cursor when omitted."""
+        book = _client.books.get_book(_book_id_from_cursor(book_id))
+        return book.get(field)
 
     @mcp.tool()
-    def volume_list_chapters(book_id: str) -> dict:
-        """List all chapters of a book."""
-        return _client.books.list_chapters(book_id)
+    def volume_get_name(book_id: str | None = None) -> str:
+        """Get just the book's title. book_id optional — defaults to the
+        book the active search cursor is pointing at."""
+        return _book_field_from_cursor("name", book_id)
 
     @mcp.tool()
-    def volume_list_images(book_id: str, chapter_id: str) -> dict:
-        """List the image files of one chapter."""
-        return _client.books.list_images(book_id, chapter_id)
+    def volume_get_alt_name(book_id: str | None = None) -> str:
+        """Get just the book's alternative name. book_id optional — defaults
+        to the book the active search cursor is pointing at."""
+        return _book_field_from_cursor("alt_name", book_id)
 
     @mcp.tool()
-    def volume_get_image(book_id: str, chapter_id: str, filename: str) -> object:
-        """Get one chapter image as image content with identifying metadata."""
-        info = _client.books.get_image(book_id, chapter_id, filename)
+    def volume_get_style(book_id: str | None = None) -> str:
+        """Get just the book's layout style ("page" or "scroll"). book_id
+        optional — defaults to the book the active search cursor is
+        pointing at."""
+        return _book_field_from_cursor("style", book_id)
+
+    @mcp.tool()
+    def volume_get_tags(book_id: str | None = None) -> str:
+        """Get just the book's tag list as a JSON array of strings
+        (e.g. ["MC:A", "x"]; "[]" when the book has no tags). book_id
+        optional — defaults to the book the active search cursor is
+        pointing at."""
+        tags = _book_field_from_cursor("tags", book_id)
+        return json.dumps(tags if tags is not None else [])
+
+    @mcp.tool()
+    def volume_get_rating(book_id: str | None = None) -> int:
+        """Get just the book's rating. book_id optional — defaults to the
+        book the active search cursor is pointing at."""
+        return _book_field_from_cursor("rating", book_id)
+
+    @mcp.tool()
+    def volume_get_active(book_id: str | None = None) -> bool:
+        """Get just the book's active flag. book_id optional — defaults to
+        the book the active search cursor is pointing at."""
+        return _book_field_from_cursor("active", book_id)
+
+    @mcp.tool()
+    def volume_list_chapters(book_id: str | None = None) -> dict:
+        """List all chapters of a book and point the chapter cursor at the
+        first one. book_id optional — defaults to the book the active
+        search cursor is pointing at."""
+        bid = _book_id_from_cursor(book_id)
+        body = _client.books.list_chapters(bid)
+        chapters = body.get("chapters", [])
+        cursor_store.open_list_cursor("c", bid, None, chapters)
+        return body
+
+    @mcp.tool()
+    def volume_list_images(chapter_id: str | None = None, book_id: str | None = None) -> dict:
+        """List the image files of one chapter and point the image cursor
+        at the first one. chapter_id optional — defaults to the chapter the
+        active chapter/image cursor points at; book_id optional — defaults
+        to the book the active search cursor is pointing at."""
+        bid = _book_id_from_cursor(book_id)
+        cid = _chapter_id_from_cursor(chapter_id)
+        body = _client.books.list_images(bid, cid)
+        cursor_store.open_list_cursor("i", bid, cid, body.get("files", []))
+        return body
+
+    @mcp.tool()
+    def volume_get_image(chapter_id: str | None = None, filename: str | None = None,
+                         book_id: str | None = None) -> object:
+        """Get one chapter image as image content with identifying metadata.
+        chapter_id optional — defaults to the chapter the active
+        chapter/image cursor points at; filename optional — defaults to the
+        file the active image cursor is pointing at; book_id optional —
+        defaults to the book the active search cursor is pointing at."""
+        bid = _book_id_from_cursor(book_id)
+        cid = _chapter_id_from_cursor(chapter_id)
+        fname = _filename_from_cursor(filename)
+        info = _client.books.get_image(bid, cid, fname)
         return [
             ImageContent(type="image", data=info["image_base64"], mimeType=info["mime_type"]),
             TextContent(type="text", text=json.dumps({
-                "book_id": book_id, "chapter_id": chapter_id, "filename": filename,
+                "book_id": bid, "chapter_id": cid, "filename": fname,
             })),
         ]
 
     @mcp.tool()
-    def volume_update_title(book_id: str, name: str) -> dict:
-        """Update the title of a book."""
-        return _client.books.update_title(book_id, name)
+    def volume_update_title(name: str, book_id: str | None = None) -> dict:
+        """Update the title of a book. book_id optional — defaults to the
+        book the active search cursor is pointing at."""
+        return _client.books.update_title(_book_id_from_cursor(book_id), name)
 
     @mcp.tool()
-    def volume_update_alt_name(book_id: str, alt_name: str) -> dict:
-        """Update the alternate name of a book."""
-        return _client.books.update_alt_name(book_id, alt_name)
+    def volume_update_alt_name(alt_name: str, book_id: str | None = None) -> dict:
+        """Update the alternate name of a book. book_id optional — defaults
+        to the book the active search cursor is pointing at."""
+        return _client.books.update_alt_name(_book_id_from_cursor(book_id), alt_name)
 
     @mcp.tool()
-    def volume_update_tags(book_id: str, tags: list[str]) -> dict:
-        """Replace the full tag list of a book."""
-        return _client.books.update_tags(book_id, tags)
+    def volume_update_tags(tags: list[str], book_id: str | None = None) -> dict:
+        """Replace the full tag list of a book. book_id optional — defaults
+        to the book the active search cursor is pointing at."""
+        return _client.books.update_tags(_book_id_from_cursor(book_id), tags)
 
     @mcp.tool()
-    def volume_update_rating(book_id: str, rating: int) -> dict:
-        """Update the rating of a book."""
-        return _client.books.update_rating(book_id, rating)
+    def volume_update_rating(rating: int, book_id: str | None = None) -> dict:
+        """Update the rating of a book. book_id optional — defaults to the
+        book the active search cursor is pointing at."""
+        return _client.books.update_rating(_book_id_from_cursor(book_id), rating)
+
+    @mcp.tool()
+    def volume_update_style(style: str, book_id: str | None = None) -> dict:
+        """Update the display style of a book ("page" or "scroll"). book_id
+        optional — defaults to the book the active search cursor is pointing at."""
+        return _client.books.update_style(_book_id_from_cursor(book_id), style)
 
     @mcp.tool()
     def volume_list_tags() -> dict:
@@ -345,14 +456,47 @@ def _make_server() -> FastMCP:
         return _client.books.guess_tags(values)
 
     @mcp.tool()
-    def volume_update_book(book_id: str, name: str, alt_name: str, rating: int,
-                           tags: list[str], active: bool, info_url: str, rss_url: str,
-                           extra_url: str, start_chapter: str, skip: str, style: str,
-                           processor: str) -> dict:
-        """Update all editable fields of a book at once."""
-        return _client.books.update_book(book_id, name, alt_name, rating, tags, active,
+    def volume_update_book(name: str, alt_name: str, rating: int, tags: list[str],
+                           active: bool, info_url: str, rss_url: str, extra_url: str,
+                           start_chapter: str, skip: str, style: str, processor: str,
+                           book_id: str | None = None) -> dict:
+        """Update all editable fields of a book at once. All fields except
+        book_id are required: pass a full book definition obtained from
+        volume_get_book. book_id is optional — defaults to the book the
+        active search cursor is pointing at."""
+        return _client.books.update_book(_book_id_from_cursor(book_id), name, alt_name, rating, tags, active,
                                          info_url, rss_url, extra_url, start_chapter,
                                          skip, style, processor)
+
+    # --- chapter/image cursors (list-level, single active) ---
+
+    @mcp.tool()
+    def chapter_next() -> dict:
+        """Advance the chapter cursor to the next chapter of the current
+        book. Envelope: { cursor_id, type: "c", book_id, chapter_id: null,
+        index, content: {name, value}, total }. At the last chapter returns
+        { status: "exhausted" }."""
+        return cursor_store.list_next()
+
+    @mcp.tool()
+    def chapter_prev() -> dict:
+        """Move the chapter cursor back one chapter. On the first chapter
+        returns { status: "at_start" }."""
+        return cursor_store.list_prev()
+
+    @mcp.tool()
+    def image_next() -> dict:
+        """Advance the image cursor to the next file of the current
+        chapter. Envelope: { cursor_id, type: "i", book_id, chapter_id,
+        index, content: filename, total }. At the last file returns
+        { status: "exhausted" }."""
+        return cursor_store.list_next()
+
+    @mcp.tool()
+    def image_prev() -> dict:
+        """Move the image cursor back one file. On the first file returns
+        { status: "at_start" }."""
+        return cursor_store.list_prev()
 
     # --- process ---
 
@@ -412,56 +556,76 @@ def _make_server() -> FastMCP:
         """Execute a plugin as a background task; returns the task_id for polling."""
         return _client.plugins.run(plugin_id, args)
 
-    # --- pagination ---
+    # --- search cursor (item-level, single active search) ---
 
     @mcp.tool()
-    def search_books(filter_text: str = "", filter_tags: str = "", rating_limit: int = 0,
-                     sorting: str = "AZ", filter_type: str = "") -> dict:
-        """Open a paginated cursor over books. Use cursor_next/cursor_prev/cursor_close to page."""
-        return cursor_store.open_cursor("books", {
+    def search_books(offset: int = 0, filter_text: str = "", filter_tags: str = "",
+                     rating_limit: int = 0, sorting: str = "AZ", filter_type: str = "") -> dict:
+        """Start (or re-issue) the book search; replaces any previous search.
+        Returns the first item: { cursor_id, type: "v", index, content, total }.
+        Re-issue with the offset carried by a sentinel to continue stepping."""
+        return cursor_store.search("v", {
             "filter_text":  filter_text,
             "filter_tags":  filter_tags,
             "rating_limit": rating_limit,
             "sorting":      sorting,
             "filter_type":  filter_type,
-        })
+        }, offset=offset)
 
     @mcp.tool()
-    def search_media(folder_id: str = "", filter_text: str = "", rating_limit: int = 0,
-                     sorting: str = "AZ") -> dict:
-        """Open a paginated cursor over media folders and files ("" = root)."""
-        return cursor_store.open_cursor("media", {
+    def search_media(folder_id: str = "", offset: int = 0, filter_text: str = "",
+                     rating_limit: int = 0, sorting: str = "AZ") -> dict:
+        """Start (or re-issue) the media search over folders and files
+        ("" = root); replaces any previous search. Returns the first item:
+        { cursor_id, type: "m", index, content, total } where content has a
+        "type": "folder"|"file" field. Re-issue with the offset carried by a
+        sentinel to continue stepping."""
+        return cursor_store.search("m", {
             "folder_id":    folder_id,
             "filter_text":  filter_text,
             "rating_limit": rating_limit,
             "sorting":      sorting,
-        })
+        }, offset=offset)
 
     @mcp.tool()
-    def search_media_by_date(start_date: str, end_date: str, rating_limit: int = 0,
-                             sorting: str = "DA") -> dict:
-        """Open a paginated cursor over media created within a date range."""
-        return cursor_store.open_cursor("media_by_date", {
+    def search_media_by_date(start_date: str, end_date: str, offset: int = 0,
+                             rating_limit: int = 0, sorting: str = "DA") -> dict:
+        """Start (or re-issue) the media-by-date search; replaces any previous
+        search. Returns the first item: { cursor_id, type: "md", index,
+        content, total } where content has a "type": "folder"|"file" field.
+        Re-issue with the offset carried by a sentinel to continue stepping."""
+        return cursor_store.search("md", {
             "start_date":   start_date,
             "end_date":     end_date,
             "rating_limit": rating_limit,
             "sorting":      sorting,
-        })
+        }, offset=offset)
 
     @mcp.tool()
-    def cursor_next(cursor_id: str) -> dict:
-        """Advance a search cursor to the next page. Returns done=true at the end."""
-        return cursor_store.next_cursor(cursor_id)
+    def cursor_info() -> dict:
+        """Describe the active search cursor without moving it:
+        { cursor_id, type, index, content, offset, fetched, total }."""
+        return cursor_store.cursor_info()
 
     @mcp.tool()
-    def cursor_prev(cursor_id: str) -> dict:
-        """Move a search cursor back one page. Returns at_start=true on the first page."""
-        return cursor_store.prev_cursor(cursor_id)
+    def cursor_next() -> dict:
+        """Advance the active search to the next item. At the end of the
+        fetched items returns { status: "exhausted", offset, total } —
+        re-issue the search with that offset to continue."""
+        return cursor_store.cursor_next()
 
     @mcp.tool()
-    def cursor_close(cursor_id: str) -> dict:
-        """Close a search cursor and release its resources."""
-        return cursor_store.close_cursor(cursor_id)
+    def cursor_prev() -> dict:
+        """Move the active search back one item. At the start of the fetched
+        items returns { status: "window_start", offset, total } (earlier items
+        exist) or { status: "at_start" } on the very first item."""
+        return cursor_store.cursor_prev()
+
+    @mcp.tool()
+    def cursor_close() -> dict:
+        """Discard the active search cursor and any active chapter/image
+        cursor."""
+        return cursor_store.cursor_close()
 
     return mcp
 

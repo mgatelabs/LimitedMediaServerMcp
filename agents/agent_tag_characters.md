@@ -6,91 +6,112 @@ book in the library and save their names as tags.
 If specific book IDs are provided when this agent is invoked, process only
 those books. Otherwise process ALL books in the library.
 
-Configuration:
-- IMAGES_TO_COLLECT = 24  (max total images per book — 4 chapters × 6 images)
-- CHAPTERS_TO_SCAN  = 4   (stop collecting once 4 chapter boundaries are crossed)
-
 All tool calls use the lms: prefix (the "lms" MCP server must be connected).
 
-────────────────────────────────────────────────────────────────────────────────
+The search cursor is item-level: search_books returns the current item
+envelope, cursor_next/cursor_prev step one item at a time, and a new search
+replaces any previous one. The chapter and image cursors work the same way
+over the current book's chapters and the current chapter's files — they are
+opened by volume_list_chapters / volume_list_images and stepped with
+chapter_next/chapter_prev and image_next/image_prev. There is no cursor_id
+to track at any level.
+
+Configuration:
+- IMAGES_PER_CHAPTER = 6   (max images taken from each chapter)
+- CHAPTERS_TO_SCAN   = 4   (stop collecting after 4 chapters)
+- Total images per book: up to 24 (4 chapters × 6 images)
+
+────────────────────────────────────────────────────────────────────────
 STEP 0 — ensure authenticated
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
 Call lms:auth_get_session_info.
 If it returns an error field, call lms:auth_login first.
 Continue once the session is valid.
 
-────────────────────────────────────────────────────────────────────────────────
-STEP 1 — open a cursor over all books
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
+STEP 1 — start the search over all books
+────────────────────────────────────────────────────────────────────────
 
-  lms:search_books()   ← no filters; returns first page + cursor_id
+  lms:search_books()   ← no filters; returns the first item
 
-Store the cursor_id. You will page through it to process every book.
+The envelope has the shape:
 
-────────────────────────────────────────────────────────────────────────────────
-STEP 2 — process books as you page through the cursor
-────────────────────────────────────────────────────────────────────────────────
+  { cursor_id, type: "v", index, content, total }
 
-For each page of cursor results (starting with the first page already returned
-by search_books, then advancing with cursor_next):
+content is the current book (id, name, tags, style, …). You do not need
+the cursor_id — cursor_next/cursor_prev operate on the active search.
 
-  For each item in items[]:
+────────────────────────────────────────────────────────────────────────
+STEP 2 — step through every book
+────────────────────────────────────────────────────────────────────────
 
-    Check item["tags"] — if any tag starts with "MC:", this book is already
-    processed. Log "SKIP <name> (<id>) — already tagged (MC: present)" and
-    continue to the next item.
+For the current item, then each subsequent item:
 
-    Otherwise inspect it (Steps 3–7 below), then continue to the next item.
+  Check content["tags"] — if any tag starts with "MC:", this book is already
+  processed. Log "SKIP <name> (<id>) — already tagged (MC: present)" and
+  advance to the next item.
 
-  Advance:
-    lms:cursor_next(cursor_id)
-    If done == true: break out of the loop.
+  Otherwise inspect it (Steps 3–7 below), then advance.
+
+Advance:
+
+  lms:cursor_next()
+
+  - Normal step: returns the next item envelope. Loop back.
+  - { status: "exhausted", offset, total }: the fetched items are done.
+    If offset < total, re-issue the SAME search with that offset
+    (lms:search_books(offset=<offset>) — it replaces the cursor and
+    returns the next item); otherwise the library is fully processed.
 
 When the loop ends:
-  lms:cursor_close(cursor_id)
+  lms:cursor_close()
 
-────────────────────────────────────────────────────────────────────────────────
-STEP 3 — load the book and begin collecting images
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
+STEP 3 — collect images across the first chapters
+────────────────────────────────────────────────────────────────────────
 
-  lms:book_select(book_id=item["id"])
-  → loads the book, its chapters, and the first chapter's image list
+  lms:volume_list_chapters()   ← book_id omitted: uses the book the
+                                   cursor is pointing at
+  → { "chapters": [ {name, value}, … ] }   (value = chapter_id)
 
-If book_select errors, log "SKIP <name> — book_select failed" and move on.
-If chapter_count == 0, log "SKIP <name> — no chapters" and move on.
-If image_count == 0, log "SKIP <name> — first chapter has no images" and move on.
+If this errors, log "SKIP <name> — volume_list_chapters failed" and move on.
+If chapters is empty, log "SKIP <name> — no chapters" and move on.
 
-Collect up to IMAGES_TO_COLLECT (24) images across up to CHAPTERS_TO_SCAN (4)
-chapters using book_next_image:
+Take up to CHAPTERS_TO_SCAN (4) chapters: chapters[0..3].
 
-  image_contents  = []
-  chapters_seen   = { 0 }   ← chapter index 0 is already loaded
-  chapters_done   = 1       ← counter of distinct chapter indices seen
+volume_list_chapters points the chapter cursor at chapters[0]. For each
+chapter — starting from the one the chapter cursor points at; stop once
+24 images are collected or the cursor returns a status sentinel:
 
-  image_contents.append( current image from book_select result )  ← index 0
+  lms:volume_list_images()   ← chapter_id/book_id omitted: applies to the
+                               chapter the chapter cursor points at
+  → { "files": ["001.jpg", …] }
+  This points the image cursor at files[0].
 
-  repeat until image_contents has 24 items OR chapters_done >= 4:
-    lms:book_next_image()
-    → [ImageContent, TextContent]  or  { "done": true }
+  For the first 6 files (skip a chapter that has none):
 
-    If done == true: stop collecting.
-    If call errors: stop collecting.
+    lms:volume_get_image()   ← chapter_id/filename/book_id omitted: applies
+                               to the image the image cursor points at
+    → [ImageContent, TextContent]
+    Add the ImageContent to image_contents.
+    If the call errors: skip this file and continue.
 
-    Read chapter_index from the TextContent payload.
-    If chapter_index not in chapters_seen:
-      chapters_seen.add(chapter_index)
-      chapters_done += 1
-      If chapters_done > CHAPTERS_TO_SCAN: stop collecting.
+    lms:image_next()   ← advance to the next file; if a status sentinel is
+                         returned, the chapter has fewer than 6 files —
+                         stop fetching for this chapter.
 
-    Add ImageContent to image_contents.
+  lms:chapter_next()   ← advance to the next chapter; if a status sentinel
+                         is returned, the book has fewer than 4 chapters.
+
+Track: chapters_scanned (chapters entered) and images collected.
 
 If image_contents is empty after collection:
   Log "SKIP <name> — could not fetch any images" and move on.
 
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 STEP 4 — vision pass (single call over all images)
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
 Send all collected ImageContent blocks in a single vision turn with this prompt:
 
@@ -134,9 +155,9 @@ If it fails again, log "SKIP <name> — vision parse failure" and move on.
 If all three lists are empty after a successful parse:
   Log "SKIP <name> — no characters identified" and move on.
 
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 STEP 5 — normalise and prefix character names
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
 For each role bucket and its prefix:
   mc  → prefix "MC:"
@@ -152,11 +173,11 @@ For each name in each bucket:
 
 Collect all prefixed names into a single flat list: tagged_names[]
 
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 STEP 6 — merge with existing tags (additive only)
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
-existing_tags = item["tags"] from the cursor page (already in memory)
+existing_tags = content["tags"] from the current item (already in memory)
 new_names     = tagged_names NOT already in existing_tags
                 (match on the full prefixed string, e.g. "MC:Luffy")
 merged_tags   = existing_tags + new_names
@@ -171,31 +192,32 @@ Note: if a character was previously tagged without a prefix (e.g. "luffy") and
 is now found as "MC:Luffy", both will exist in the tag list. Do not attempt to
 deduplicate or remove the old unprefixed tag — leave that for manual cleanup.
 
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 STEP 7 — write tags and verify
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
-Use book_update on the currently selected book (no need to re-fetch book_id):
-
-  lms:book_update(tags=merged_tags)
+  lms:volume_update_tags(tags=merged_tags)   ← book_id omitted: applies to
+                                                the book the cursor points at
 
 If this errors, log the error and do not retry.
 
 Verify:
-  lms:book_get_context()  → confirm saved tags contain the new names.
+  lms:volume_get_tags()   ← book_id omitted: applies to the book the
+                             cursor points at
+  → confirm the returned list contains the new names.
 
 Log:
   TAGGED <name> (<id>)
-    Chapters scanned : <chapters_done>
+    Chapters scanned : <chapters_scanned>
     Images collected : <count>
     MC : <comma-separated MC: names, or "none">
     PC : <comma-separated PC: names, or "none">
     AN : <comma-separated AN: names, or "none">
     Added : <comma-separated new prefixed tags>
 
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 FINAL SUMMARY
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
   Books processed  : <n>
   Tagged           : <n>

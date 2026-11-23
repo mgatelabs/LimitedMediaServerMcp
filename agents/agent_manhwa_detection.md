@@ -12,78 +12,100 @@ If no book IDs are specified, process ALL books in the library.
 
 All tool calls use the lms: prefix (the "lms" MCP server must be connected).
 
+The search cursor is item-level: search_books returns the current item
+envelope, cursor_next/cursor_prev step one item at a time, and a new search
+replaces any previous one. The chapter and image cursors work the same way
+over the current book's chapters and the current chapter's files — they are
+opened by volume_list_chapters / volume_list_images and stepped with
+chapter_next/chapter_prev and image_next/image_prev. There is no cursor_id
+to track at any level.
+
 Configuration:
 - IMAGES_TO_CHECK = 4 (images fetched from the first chapter per book)
 
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 STEP 0 — ensure authenticated
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
 Call lms:auth_get_session_info.
 If it returns an error field, call lms:auth_login first.
 Continue once the session is valid.
 
-────────────────────────────────────────────────────────────────────────────────
-STEP 1 — open a cursor over all books
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
+STEP 1 — start the search over all books
+────────────────────────────────────────────────────────────────────────
 
-  lms:search_books()   ← no filters; returns first page + cursor_id
+  lms:search_books()   ← no filters; returns the first item
 
-Store the cursor_id. You will page through it to find page-style books.
+The envelope has the shape:
 
-────────────────────────────────────────────────────────────────────────────────
-STEP 2 — process books as you page through the cursor
-────────────────────────────────────────────────────────────────────────────────
+  { cursor_id, type: "v", index, content, total }
 
-For each page of cursor results (starting with the first page already returned
-by search_books, then advancing with cursor_next):
+content is the current book (id, name, style, tags, …). You do not need
+the cursor_id — cursor_next/cursor_prev operate on the active search.
 
-  For each item in items[]:
+────────────────────────────────────────────────────────────────────────
+STEP 2 — step through every book
+────────────────────────────────────────────────────────────────────────
 
-    If item["style"] != "page": skip — already scroll style, nothing to do.
+For the current item, then each subsequent item:
 
-    Otherwise inspect it (Steps 3–6 below), then continue to the next item.
+  If content["style"] != "page": skip — already scroll style, nothing to do.
 
-  Advance:
-    lms:cursor_next(cursor_id)
-    If done == true: break out of the loop.
+  Otherwise inspect it (Steps 3–6 below), then advance.
+
+Advance:
+
+  lms:cursor_next()
+
+  - Normal step: returns the next item envelope. Loop back.
+  - { status: "exhausted", offset, total }: the fetched items are done.
+    If offset < total, re-issue the SAME search with that offset
+    (lms:search_books(offset=<offset>) — it replaces the cursor and
+    returns the next item); otherwise the library is fully processed.
 
 When the loop ends:
-  lms:cursor_close(cursor_id)
+  lms:cursor_close()
 
-────────────────────────────────────────────────────────────────────────────────
-STEP 3 — load the book and collect images from first chapter
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
+STEP 3 — collect images from the first chapter
+────────────────────────────────────────────────────────────────────────
 
-  lms:book_select(book_id=item["id"])
-  → loads the book, its chapters, and the first chapter's image list
+  lms:volume_list_chapters()   ← book_id omitted: uses the book the
+                                   cursor is pointing at
+  → { "chapters": [ {name, value}, … ] }   (value = chapter_id)
 
-If book_select errors, log "SKIP <name> — book_select failed" and move on.
-If chapter_count == 0, log "SKIP <name> — no chapters" and move on.
-If image_count == 0, log "SKIP <name> — first chapter has no images" and move on.
+If this errors, log "SKIP <name> — volume_list_chapters failed" and move on.
+If chapters is empty, log "SKIP <name> — no chapters" and move on.
 
-Collect up to IMAGES_TO_CHECK (4) images using book_next_image:
+volume_list_chapters points the chapter cursor at chapters[0], so the image
+cursor opens on the first chapter too:
+
+  lms:volume_list_images()   ← chapter_id and book_id omitted: defaults to
+                               the chapter cursor's current chapter (chapter 1)
+  → { "files": ["001.jpg", …] }
+
+If this errors, log "SKIP <name> — volume_list_images failed" and move on.
+If files is empty, log "SKIP <name> — first chapter has no images" and move on.
+
+volume_list_images points the image cursor at files[0]. Fetch up to
+IMAGES_TO_CHECK (4) images by leaving chapter_id/filename/book_id omitted —
+every call applies to the image cursor's current file — stepping with
+image_next between fetches:
 
   image_contents = []
-  image_contents.append( current image from book_select result )  ← index 0 is
-                                                                     already loaded
-
-  repeat up to 3 more times:
-    lms:book_next_image()
-    → [ImageContent, TextContent]  or  { "done": true }
-    If done == true: stop collecting.
-    If ImageContent returned: add to image_contents.
-    If call errors: stop collecting.
+  lms:volume_get_image()
+  → [ImageContent, TextContent]
+  Add the ImageContent to image_contents. If the call errors: stop collecting.
+  Repeat up to 4 times, calling lms:image_next() between fetches. If
+  image_next returns a status sentinel (the chapter has fewer than 4
+  files), stop collecting.
 
 If image_contents is empty, log "SKIP <name> — could not fetch images" and move on.
 
-Note: book_next_image crosses chapter boundaries automatically. Since we only
-want the first chapter's images, stop collecting as soon as done==true OR
-the TextContent shows chapter_index > 0.
-
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 STEP 4 — vision classification (single call per book)
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
 Send all collected ImageContent blocks in a single vision turn with this prompt:
 
@@ -140,9 +162,9 @@ Parse the JSON response. If parsing fails, retry once adding:
 "Return only valid JSON, no other text."
 If it fails again, log "SKIP <name> — vision parse failure" and move on.
 
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 STEP 5 — act on the classification
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
 If style == "page" OR confidence == "low":
   Log "KEEP <name> (<id>) — classified as page (confidence: <confidence>)"
@@ -156,27 +178,28 @@ If style == "stripped-manga" AND confidence is "high" or "medium":
 If style == "manhwa" AND confidence is "high" or "medium":
   Proceed to Step 6.
 
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 STEP 6 — update style to scroll
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
-Use book_update on the currently selected book (no need to re-fetch book_id):
-
-  lms:book_update(style="scroll")
+  lms:volume_update_style(style="scroll")   ← book_id omitted: applies to
+                                               the book the cursor points at
 
 If the call errors, log the error and do not retry.
 
 Verify:
-  lms:book_get_context()  → confirm style == "scroll"
+  lms:volume_get_style()   ← book_id omitted: applies to the book the
+                              cursor points at
+  → confirm it returns "scroll"
 
 Log:
   UPDATED <name> (<id>) — style changed to scroll
             confidence: <confidence>
             reason: <reason from vision>
 
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 FINAL SUMMARY
-────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────
 
   Page-style books inspected : <n>
   Updated to scroll          : <n>

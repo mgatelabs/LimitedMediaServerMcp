@@ -7,6 +7,8 @@ All write/list calls use `multipart/form-data` POST bodies.
 
 **Access control:** the server enforces per-request access on every call. Books whose `rating` exceeds the authenticated user's volume rating limit (`SESSION.limits.volume`) are invisible — list calls omit them and direct fetch calls return an error. Each image fetch is independently verified. This is enforced server-side; the agent cannot bypass it.
 
+**Cursor fallback:** the `book_id` parameter is optional on every tool in this file except `volume_list_books`. When omitted, the tool applies to the book the active search cursor points at (set by `search_books` + `cursor_next`/`cursor_prev` — see `07-pagination-tools.md`). If no book search is active, the call raises an error.
+
 ---
 
 ## Tool: `volume_list_books`
@@ -57,7 +59,7 @@ All write/list calls use `multipart/form-data` POST bodies.
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `book_id` | string | yes | Book ID (the `id` / `json` field) |
+| `book_id` | string | no | Book ID (the `id` / `json` field). Optional — defaults to the book the active search cursor points at |
 
 **Backend endpoint:** `POST /api/volume/details`
 
@@ -75,6 +77,32 @@ All write/list calls use `multipart/form-data` POST bodies.
 
 ---
 
+## Single-field getters (one-horse-pony)
+
+Six tools return **just one field** of the book definition instead of the
+whole object — for agents that only need a specific value (e.g. confirming
+a style write, or reading tags before merging). All share the same shape:
+
+| Tool | Returns |
+|---|---|
+| `volume_get_name` | the title (`name`) — string |
+| `volume_get_alt_name` | the alternative name (`alt_name`) — string |
+| `volume_get_style` | the layout style (`style`) — string, `"page"` or `"scroll"` |
+| `volume_get_tags` | the tag list (`tags`) — JSON array of strings, e.g. `["MC:A", "x"]`; `"[]"` when empty |
+| `volume_get_rating` | the rating (`rating`) — integer |
+| `volume_get_active` | the active flag (`active`) — boolean |
+
+**Parameters (all six):**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `book_id` | string | no | Book ID. Optional — defaults to the book the active search cursor points at |
+
+**Backend endpoint:** `POST /api/volume/details` (same call as
+`volume_get_book`; the server extracts the single field).
+
+---
+
 ## Tool: `volume_list_chapters`
 
 **Purpose:** List all chapters for a book.
@@ -85,7 +113,7 @@ All write/list calls use `multipart/form-data` POST bodies.
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `book_id` | string | yes | Book ID |
+| `book_id` | string | no | Book ID. Optional — defaults to the book the active search cursor points at |
 
 **Backend endpoint:** `POST /api/volume/list/chapters`
 
@@ -105,6 +133,12 @@ All write/list calls use `multipart/form-data` POST bodies.
 
 `value` is the chapter ID used in subsequent image calls.
 
+**Side effect:** this call points the **chapter cursor** at `chapters[0]`
+(single-active list cursor; see [`docs/07`](07-pagination-tools.md)). While
+it is active, `volume_list_images` and `volume_get_image` may omit
+`chapter_id` — they apply to the chapter the cursor points at — and
+`chapter_next` / `chapter_prev` step through the book's chapters.
+
 ---
 
 ## Tool: `volume_list_images`
@@ -117,8 +151,8 @@ All write/list calls use `multipart/form-data` POST bodies.
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `book_id` | string | yes | Book ID |
-| `chapter_id` | string | yes | Chapter value/ID |
+| `book_id` | string | no | Book ID. Optional — defaults to the book the active search cursor points at |
+| `chapter_id` | string | no | Chapter value/ID. Optional — defaults to the chapter the active chapter/image cursor points at |
 
 **Backend endpoint:** `POST /api/volume/list/images`
 
@@ -140,6 +174,12 @@ All write/list calls use `multipart/form-data` POST bodies.
 The first entry in `files[0]` of the first chapter is treated as the cover image.  
 To get the cover: call `volume_list_chapters`, take `chapters[0].value`, call `volume_list_images`, take `files[0]`, then call `volume_get_image`.
 
+**Side effect:** this call points the **image cursor** at `files[0]`
+(single-active list cursor; see [`docs/07`](07-pagination-tools.md)). While
+it is active, `volume_get_image` may omit `filename` — it fetches the image
+the cursor points at — and `image_next` / `image_prev` step through the
+chapter's files.
+
 ---
 
 ## Tool: `volume_get_image`
@@ -152,9 +192,14 @@ To get the cover: call `volume_list_chapters`, take `chapters[0].value`, call `v
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `book_id` | string | yes | Book ID |
-| `chapter_id` | string | yes | Chapter ID |
-| `filename` | string | yes | Image filename (e.g. `001.jpg`) |
+| `book_id` | string | no | Book ID. Optional — defaults to the book the active search cursor points at |
+| `chapter_id` | string | no | Chapter ID. Optional — defaults to the chapter the active chapter/image cursor points at |
+| `filename` | string | no | Image filename (e.g. `001.jpg`). Optional — defaults to the file the active image cursor points at |
+
+With all three omitted, the call fetches the image the cursor stack points
+at: the search cursor's book → the chapter cursor's chapter → the image
+cursor's file. After `volume_list_chapters` + `volume_list_images` with no
+arguments, `volume_get_image()` with no arguments returns the book's cover.
 
 **Backend endpoint:** `GET /api/volume/serve_image/{book_id}/{chapter_id}/{filename}`
 
@@ -190,7 +235,7 @@ MIME type is inferred from the filename extension (`.jpg`/`.jpeg` → `image/jpe
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `book_id` | string | yes | Book ID |
+| `book_id` | string | no | Book ID. Optional — defaults to the book the active search cursor points at |
 | `name` | string | yes | New title |
 
 **Implementation:** calls `volume_get_book(book_id)` to fetch the full `BookDefinition`, updates the `name` field, then posts the full object to `POST /api/volume/update`.
@@ -232,7 +277,7 @@ MIME type is inferred from the filename extension (`.jpg`/`.jpeg` → `image/jpe
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `book_id` | string | yes | Book ID |
+| `book_id` | string | no | Book ID. Optional — defaults to the book the active search cursor points at |
 | `alt_name` | string | yes | New alternative name |
 
 **Implementation:** same fetch-then-update pattern as `volume_update_title`, changing only `alt_name`.
@@ -256,7 +301,7 @@ MIME type is inferred from the filename extension (`.jpg`/`.jpeg` → `image/jpe
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `book_id` | string | yes | Book ID |
+| `book_id` | string | no | Book ID. Optional — defaults to the book the active search cursor points at |
 | `tags` | array of strings | yes | Complete new tag list (replaces existing) |
 
 **Implementation:** same fetch-then-update pattern, replacing `tags` with the provided list.
@@ -282,10 +327,34 @@ MIME type is inferred from the filename extension (`.jpg`/`.jpeg` → `image/jpe
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `book_id` | string | yes | Book ID |
+| `book_id` | string | no | Book ID. Optional — defaults to the book the active search cursor points at |
 | `rating` | integer | yes | New rating value (valid range determined by the server, typically 0–5) |
 
 **Implementation:** same fetch-then-update pattern as `volume_update_title` — fetch the full book, replace `rating`, post back.
+
+**Backend endpoint:** `POST /api/volume/update`
+
+**Returns:**
+```json
+{ "success": true, "message": "" }
+```
+
+---
+
+## Tool: `volume_update_style`
+
+**Purpose:** Update the display style of a book — `"page"` (discrete pages) or `"scroll"` (vertical strip, manhwa/webtoon).
+
+**MCP tool name:** `volume_update_style`
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|---|---|---|---|
+| `book_id` | string | no | Book ID. Optional — defaults to the book the active search cursor points at |
+| `style` | string | yes | Display style: `"page"` or `"scroll"` |
+
+**Implementation:** same fetch-then-update pattern as `volume_update_title` — fetch the full book, replace `style`, post back.
 
 **Backend endpoint:** `POST /api/volume/update`
 
@@ -354,7 +423,7 @@ MIME type is inferred from the filename extension (`.jpg`/`.jpeg` → `image/jpe
 
 | Name | Type | Required | Description |
 |---|---|---|---|
-| `book_id` | string | yes | Book ID (cannot be changed) |
+| `book_id` | string | no | Book ID. Optional — defaults to the book the active search cursor points at |
 | `name` | string | yes | Display title |
 | `alt_name` | string | yes | Alternative name / description (empty string to clear) |
 | `rating` | integer | yes | Rating (0–5) |

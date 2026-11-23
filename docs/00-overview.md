@@ -12,18 +12,18 @@ A single-instance Model Context Protocol (MCP) server written in Python that giv
 | 01 | `01-architecture.md` | Component layout, auth lifecycle, error strategy |
 | 02 | `02-auth-tools.md` | Authentication tool contracts |
 | 03 | `03-media-tools.md` | Media (file/folder) tool contracts — list, get, download, upload, move, create, update, migrate, preview |
-| 04 | `04-volume-tools.md` | Volume (book/chapter/image) tool contracts — list, get, update, import from URL |
+| 04 | `04-volume-tools.md` | Volume (book/chapter/image) tool contracts — list, get (full book + single-field `volume_get_<field>` getters), update; `book_id`/`chapter_id`/`filename` fall back to the cursor stack |
 | 05 | `05-implementation-guide.md` | Step-by-step build instructions for the implementing AI |
 | 06 | `06-vision-workflow.md` | How the agent uses vision to extract and write book metadata |
-| 07 | `07-pagination-tools.md` | Cursor-based pagination: `search_books`, `search_media`, `cursor_next/prev/close` |
+| 07 | `07-pagination-tools.md` | Item-level search cursor: `search_books`, `search_media`(+`_by_date`), `cursor_info/next/prev/close` — one active search, one-item stepping, offset-based resume; chapter/image list cursors: `chapter_next/prev`, `image_next/prev` — one-item stepping over the current book's chapters and chapter's files |
 | 08 | `08-configuration.md` | `config.json` schema — server address, HTTPS, SSL, credentials |
 | 09 | `09-process-tools.md` | Process/task tools — list, status, log, cancel, stop, restart |
 | 10 | `10-plugin-tools.md` | Plugin tools — list (AI and Angular), describe, run, track via process tools |
 | 11 | `11-session-features.md` | Session feature flags and limits — bitmask reference, `auth_get_session_info` tool |
 | 12 | `12-backend-plugin-ai-spec.md` | **Backend spec (not MCP)** — AI-friendly plugin endpoints; `action.book.import-url` plugin spec |
 | 13 | `13-client-integration.md` | **Placeholder** — connecting the MCP server to OpenCode and other clients; same-machine constraint, stdio vs TCP |
-| 14 | `14-book-navigation.md` | Stateful book navigation tools — `book_select`, `book_get_context`, `book_next/prev_chapter`, `book_next/prev_image`, `book_update` |
-| 15 | `15-book-navigation-impl.md` | Implementation guide for the book navigation module (`book_session.py` + `mcp_server.py` additions) |
+| 14 | `14-book-navigation.md` | **Superseded** — stateful `book_*` navigation tools (removed); the search cursor (`07`) + volume tools now cover this |
+| 15 | `15-book-navigation-impl.md` | **Superseded** — implementation guide for the removed `book_session.py` module |
 | 16 | `16-agent-character-extraction.md` | Agent script — extract character names from book images via vision and store them as tags |
 | 17 | `17-folder-stack-tools.md` | Server-side folder stack tools — `folder_stack_create`, `push_children`, `pop`, `peek`, `close` for depth-first media tree traversal |
 | 18 | `18-file-navigation.md` | Stateful file navigation tools — `files_open`, `files_current`, `files_next`, `files_prev`, `files_get_preview` |

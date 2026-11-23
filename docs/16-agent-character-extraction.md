@@ -58,6 +58,10 @@ volume_list_chapters(book_id)
 → chapters[]   ← list of {name, value} objects
 ```
 
+This call also points the **chapter cursor** at `chapters[0]` (single-active
+list cursor — see `07-pagination-tools.md`), so `chapter_id` can be omitted
+from the image calls below and `chapter_next` can step through the book.
+
 Take only the first 4 chapters: `chapters[0..3]`.
 If the book has fewer than 4 chapters, use all of them.
 If `chapters` is empty, skip the book.
@@ -66,14 +70,18 @@ If `chapters` is empty, skip the book.
 
 ### Phase 2 — vision pass over chapters 1–4
 
-For each chapter in `chapters[0..3]`:
+For each chapter — the chapter cursor starts at `chapters[0]`; step with
+`chapter_next` and stop at 4 chapters or the `exhausted` sentinel:
 
 #### Step 3. List images in the chapter
 
 ```
-volume_list_images(book_id, chapter_id=chapter.value)
+volume_list_images()   ← chapter_id/book_id omitted: applies to the chapter
+                         the chapter cursor points at
 → files[]   ← list of image filenames
 ```
+
+This call also points the **image cursor** at `files[0]`.
 
 #### Step 4. Fetch images for vision
 
@@ -83,11 +91,14 @@ Fetch up to **6 images** from each chapter — the first 6 in `files[]`.
 Fewer is fine if a chapter has fewer than 6 images.
 
 ```
-for filename in files[:6]:
-    volume_get_image(book_id, chapter_id=chapter.value, filename=filename)
-    → [ImageContent, TextContent]
-    keep the ImageContent for the vision call below
-    skip this filename and continue if the call returns an error
+volume_get_image()   ← chapter_id/filename/book_id omitted: applies to the
+                       image the image cursor points at
+→ [ImageContent, TextContent]
+keep the ImageContent for the vision call below
+skip this image and continue if the call returns an error
+
+image_next()   ← step to the next file; stop fetching for this chapter
+                 when a status sentinel is returned (fewer than 6 files)
 ```
 
 Collect all `ImageContent` blocks from across all 4 chapters into a single list.
@@ -165,10 +176,10 @@ If this call returns an error, log it and do not retry.
 #### Step 9. Verify
 
 ```
-volume_get_book(book_id)
+volume_get_tags(book_id)
 ```
 
-Confirm that `tags` in the response includes the newly added character names.
+Confirm the returned tag list includes the newly added character names.
 Log a success summary: book name, how many new character tags were added, the names added.
 
 ---
@@ -232,7 +243,7 @@ Step 7: existing = ["action", "shounen"]
 
 Step 8: volume_update_tags("manga-001", tags=["action","shounen","luffy","zoro","nami","shanks"])
 
-Step 9: volume_get_book("manga-001") → confirm tags saved
+Step 9: volume_get_tags("manga-001") → confirm tags saved
 
 Output:
   Book: One Piece Vol.1 (manga-001)
